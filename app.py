@@ -17,7 +17,8 @@ db = SQLAlchemy()
 
 def create_app():
     app = Flask(__name__)
-    # Normalize Render's URL for SQLAlchemy (psycopg3)
+
+    # psycopg3 URL normalization
     db_url = os.getenv("DATABASE_URL", "sqlite:///local.db")
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql+psycopg://", 1)
@@ -29,179 +30,168 @@ def create_app():
     CORS(app)
     db.init_app(app)
 
-    @app.route("/ping")
+    @app.get("/ping")
     def ping():
         return {"ok": True, "time": utcnow().isoformat()}
 
     # ---------- MODELS ----------
-    class Topic(db.Model):
-        __tablename__ = "topics"
-        id = db.Column(db.String, primary_key=True, default=lambda: str(uuid.uuid4()))
-        name = db.Column(db.String(120), nullable=False)
-        emoji = db.Column(db.String(8), nullable=True)
-        color = db.Column(db.Integer, nullable=False, default=0xFF6AA6FF)
-        updated_at = db.Column(db.DateTime, nullable=False, default=utcnow, index=True)
-
-    class List(db.Model):
-        __tablename__ = "lists"
-        id = db.Column(db.String, primary_key=True, default=lambda: str(uuid.uuid4()))
-        topic_id = db.Column(db.String, db.ForeignKey("topics.id", ondelete="SET NULL"))
+    class IndexEntry(db.Model):
+        """
+        One metadata row per entity.
+        kind: 'project' | 'process' | 'list'
+        container_id: parent entity (for lists under a project/process); NULL for containers and general lists
+        """
+        __tablename__ = "index_entries"
+        id = db.Column(db.String, primary_key=True)
+        kind = db.Column(db.String(16), nullable=False)  # project | process | list
+        container_id = db.Column(db.String, db.ForeignKey("index_entries.id", ondelete="CASCADE"), nullable=True)
         name = db.Column(db.String(160), nullable=False)
         emoji = db.Column(db.String(8), nullable=True)
         color = db.Column(db.Integer, nullable=False, default=0xFF6AA6FF)
         opened_at = db.Column(db.DateTime, nullable=True, index=True)
         updated_at = db.Column(db.DateTime, nullable=False, default=utcnow, index=True)
 
-    class ListItem(db.Model):
+    class ListContent(db.Model):
         """
-        Rich text content stored as JSON Delta (or your own shape)
-        Example content_json: { "ops":[{"insert":"Hello"},{"attributes":{"bold":true},"insert":" world"}] }
+        Content for both containers and lists (1:1 with index_entries by id).
+        container_id duplicated here for convenient filtering; cascades with parent.
         """
-        __tablename__ = "list_items"
-        id = db.Column(db.String, primary_key=True, default=lambda: str(uuid.uuid4()))
-        list_id = db.Column(db.String, db.ForeignKey("lists.id", ondelete="CASCADE"), index=True)
-        order_idx = db.Column(db.Integer, nullable=False, default=0)
+        __tablename__ = "list_contents"
+        id = db.Column(db.String, db.ForeignKey("index_entries.id", ondelete="CASCADE"), primary_key=True)
+        container_id = db.Column(db.String, db.ForeignKey("index_entries.id", ondelete="CASCADE"), nullable=True)
         content_json = db.Column(JSONB, nullable=False)
         updated_at = db.Column(db.DateTime, nullable=False, default=utcnow, index=True)
 
-    # ---------- HELPERS ----------
-    def topic_json(t: Topic): return {
-        "id": t.id, "name": t.name, "emoji": t.emoji, "color": t.color,
-        "updated_at": t.updated_at.isoformat()
-    }
-
-    def list_meta_json(l: List): return {
-        "id": l.id, "topic_id": l.topic_id, "name": l.name, "emoji": l.emoji,
-        "color": l.color, "opened_at": l.opened_at.isoformat() if l.opened_at else None,
-        "updated_at": l.updated_at.isoformat()
-    }
-
-    def item_json(i: ListItem): return {
-        "id": i.id, "list_id": i.list_id, "order_idx": i.order_idx,
-        "content_json": i.content_json, "updated_at": i.updated_at.isoformat()
-    }
-
-    # ---------- ROUTES ----------
-    @app.post("/topics")
-    def create_topic():
-        require_key()
-        data = request.get_json(force=True) or {}
-        t = Topic(name=data["name"], emoji=data.get("emoji"), color=data.get("color", 0xFF6AA6FF))
-        db.session.add(t); db.session.commit()
-        return topic_json(t), 201
-
-    @app.get("/topics")
-    def get_topics():
-        require_key()
-        q = Topic.query.order_by(Topic.updated_at.desc()).all()
-        return jsonify([topic_json(t) for t in q])
-
-    @app.post("/lists")
-    def create_list():
-        require_key()
-        d = request.get_json(force=True) or {}
-        l = List(
-            topic_id=d.get("topic_id"),
-            name=d["name"], emoji=d.get("emoji"), color=d.get("color", 0xFF6AA6FF),
-            opened_at=utcnow(), updated_at=utcnow()
-        )
-        db.session.add(l); db.session.commit()
-        return list_meta_json(l), 201
-
-    @app.get("/lists")
-    def get_lists():
-        require_key()
-        # metadata only
-        since = request.args.get("updated_since")
-        q = List.query
-        if since:
-            q = q.filter(List.updated_at > dt.datetime.fromisoformat(since.replace("Z","")))
-        q = q.order_by(List.updated_at.desc()).all()
-        return jsonify([list_meta_json(l) for l in q])
-
-    @app.put("/lists/<list_id>")
-    def update_list(list_id):
-        require_key()
-        l = List.query.get_or_404(list_id)
-        d = request.get_json(force=True) or {}
-        if "name" in d: l.name = d["name"]
-        if "emoji" in d: l.emoji = d["emoji"]
-        if "color" in d: l.color = d["color"]
-        if d.get("mark_opened"): l.opened_at = utcnow()
-        l.updated_at = utcnow()
-        db.session.commit()
-        return list_meta_json(l)
-
-    @app.delete("/lists/<list_id>")
-    def delete_list(list_id):
-        require_key()
-        ListItem.query.filter_by(list_id=list_id).delete()
-        List.query.filter_by(id=list_id).delete()
-        db.session.commit()
-        return {"ok": True}
-
-    @app.get("/lists/<list_id>/items")
-    def get_items(list_id):
-        require_key()
-        items = ListItem.query.filter_by(list_id=list_id).order_by(ListItem.order_idx.asc()).all()
-        return jsonify([item_json(i) for i in items])
-
-    @app.post("/lists/<list_id>/items")
-    def add_item(list_id):
-        require_key()
-        d = request.get_json(force=True) or {}
-        # expect content_json = { ...rich text... }
-        max_idx = db.session.query(db.func.coalesce(db.func.max(ListItem.order_idx), -1)).filter_by(list_id=list_id).scalar()
-        it = ListItem(list_id=list_id, order_idx=(max_idx + 1), content_json=d["content_json"], updated_at=utcnow())
-        db.session.add(it)
-        # bump list updated_at
-        l = List.query.get(list_id)
-        if l: l.updated_at = utcnow()
-        db.session.commit()
-        return item_json(it), 201
-
-    @app.put("/lists/<list_id>/items/reorder")
-    def reorder_items(list_id):
-        require_key()
-        d = request.get_json(force=True) or {}
-        ids = d.get("item_ids", [])
-        for idx, item_id in enumerate(ids):
-            ListItem.query.filter_by(id=item_id, list_id=list_id).update({
-                "order_idx": idx, "updated_at": utcnow()
-            })
-        l = List.query.get(list_id)
-        if l: l.updated_at = utcnow()
-        db.session.commit()
-        return {"ok": True}
-
-    @app.put("/lists/<list_id>/items/<item_id>")
-    def update_item(list_id, item_id):
-        require_key()
-        d = request.get_json(force=True) or {}
-        it = ListItem.query.filter_by(id=item_id, list_id=list_id).first_or_404()
-        if "content_json" in d: it.content_json = d["content_json"]
-        if "order_idx" in d: it.order_idx = int(d["order_idx"])
-        it.updated_at = utcnow()
-        l = List.query.get(list_id)
-        if l: l.updated_at = utcnow()
-        db.session.commit()
-        return item_json(it)
-
-    @app.get("/sync")
-    def sync():
-        """Return lists metadata and items updated since a timestamp (UTC ISO)."""
-        require_key()
-        since = request.args.get("updated_since")
-        if not since:
-            abort(400, "Provide updated_since=ISO8601")
-        ts = dt.datetime.fromisoformat(since.replace("Z",""))
-        lists = List.query.filter(List.updated_at > ts).all()
-        items = ListItem.query.filter(ListItem.updated_at > ts).all()
+    # ---------- Helpers ----------
+    def idx_json(e: IndexEntry):
         return {
-            "lists": [list_meta_json(l) for l in lists],
-            "items": [item_json(i) for i in items],
-            "server_time": utcnow().isoformat()
+            "id": e.id,
+            "kind": e.kind,
+            "container_id": e.container_id,
+            "name": e.name,
+            "emoji": e.emoji,
+            "color": e.color,
+            "opened_at": e.opened_at.isoformat() if e.opened_at else None,
+            "updated_at": e.updated_at.isoformat(),
         }
+
+    # ---------- API ----------
+    @app.get("/index")
+    def get_index():
+        """Fast list for the front menu (metadata only). Optional ?updated_since=ISO8601"""
+        require_key()
+        since = request.args.get("updated_since")
+        q = IndexEntry.query
+        if since:
+            ts = dt.datetime.fromisoformat(since.replace("Z", ""))
+            q = q.filter(IndexEntry.updated_at > ts)
+        q = q.order_by(IndexEntry.updated_at.desc()).all()
+        return jsonify([idx_json(e) for e in q])
+
+    @app.post("/entities")
+    def create_entity():
+        """
+        Unified create for project/process/list.
+        Body:
+        {
+          "kind": "project" | "process" | "list",
+          "name": "...",
+          "emoji": "…",
+          "color": 4284287999,
+          "content_json": { ... },
+          "container_id": "UUID or null"
+        }
+        Rules:
+          - project/process MUST have container_id = null
+          - list MAY have container_id (nested) or null (general list)
+        """
+        require_key()
+        d = request.get_json(force=True) or {}
+        kind = d.get("kind")
+        if kind not in ("project", "process", "list"):
+            abort(400, "kind must be 'project' | 'process' | 'list'")
+        name = d["name"]
+        emoji = d.get("emoji")
+        color = d.get("color", 0xFF6AA6FF)
+        content_json = d.get("content_json", {})
+        container_id = d.get("container_id")
+
+        if kind in ("project", "process") and container_id is not None:
+            abort(400, "containers cannot have container_id")
+
+        _id = str(uuid.uuid4())
+        now = utcnow()
+
+        idx = IndexEntry(
+            id=_id, kind=kind, container_id=container_id, name=name, emoji=emoji,
+            color=color, opened_at=now, updated_at=now
+        )
+        db.session.add(idx)
+        db.session.add(ListContent(id=_id, container_id=container_id, content_json=content_json, updated_at=now))
+        db.session.commit()
+        return {"id": _id, "kind": kind, "container_id": container_id}, 201
+
+    @app.delete("/entities/<entity_id>")
+    def delete_entity(entity_id):
+        """
+        Delete any entity (project/process/list).
+        - Deleting a container cascades to its child lists (index + content).
+        """
+        require_key()
+        IndexEntry.query.filter_by(id=entity_id).delete(synchronize_session=False)
+        db.session.commit()
+        return {"ok": True}
+
+    @app.get("/content/<entity_id>")
+    def get_content(entity_id):
+        """Fetch content_json for any entity."""
+        require_key()
+        row = ListContent.query.get_or_404(entity_id)
+        return {
+            "id": row.id,
+            "container_id": row.container_id,
+            "content_json": row.content_json,
+            "updated_at": row.updated_at.isoformat()
+        }
+
+    @app.put("/content/<entity_id>")
+    def update_content(entity_id):
+        """Update content_json (and bump index.updated_at)."""
+        require_key()
+        d = request.get_json(force=True) or {}
+        if "content_json" not in d:
+            abort(400, "content_json required")
+        now = utcnow()
+        row = ListContent.query.get_or_404(entity_id)
+        row.content_json = d["content_json"]
+        row.updated_at = now
+        IndexEntry.query.filter_by(id=entity_id).update({"updated_at": now})
+        db.session.commit()
+        return {"ok": True, "updated_at": now.isoformat()}
+
+    @app.put("/entities/<entity_id>")
+    def update_entity_meta(entity_id):
+        """
+        Update metadata (name/emoji/color, mark opened).
+        Body may include: name, emoji, color, mark_opened (bool)
+        """
+        require_key()
+        d = request.get_json(force=True) or {}
+        now = utcnow()
+
+        updates = {}
+        for k in ("name", "emoji", "color"):
+            if k in d:
+                updates[k] = d[k]
+        if d.get("mark_opened"):
+            updates["opened_at"] = now
+        updates["updated_at"] = now
+
+        changed = IndexEntry.query.filter_by(id=entity_id).update(updates)
+        if not changed:
+            abort(404)
+        db.session.commit()
+        return {"ok": True, "updated_at": now.isoformat()}
 
     with app.app_context():
         db.create_all()
@@ -209,5 +199,5 @@ def create_app():
     return app
 
 app = create_app()
+# Run on Render: gunicorn app:app
 
-# Render runs via gunicorn: web: gunicorn app:app
