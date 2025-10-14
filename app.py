@@ -47,7 +47,7 @@ def create_app():
         container_id = db.Column(db.String, db.ForeignKey("index_entries.id", ondelete="CASCADE"), nullable=True)
         name = db.Column(db.String(160), nullable=False)
         emoji = db.Column(db.String(8), nullable=True)
-        color = db.Column(db.Integer, nullable=False, default=0xFF6AA6FF)
+        color = db.Column(db.BigInteger, nullable=False, default=0xFF6AA6FF)
         opened_at = db.Column(db.DateTime, nullable=True, index=True)
         updated_at = db.Column(db.DateTime, nullable=False, default=utcnow, index=True)
 
