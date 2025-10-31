@@ -35,6 +35,13 @@ def create_app():
         return {"ok": True, "time": utcnow().isoformat()}
 
     # ---------- MODELS ----------
+    class EditorContent(db.Model):
+        __tablename__ = "editor_contents"
+        # location examples: "main", project/process ids, etc.
+        location = db.Column(db.String(160), primary_key=True)
+        content = db.Column(db.Text, nullable=False, default="")
+        updated_at = db.Column(db.DateTime, nullable=False, default=utcnow, index=True)
+
     class IndexEntry(db.Model):
         """
         One metadata row per entity.
@@ -240,6 +247,36 @@ def create_app():
         db.session.commit()
         return {"ok": True, "updated_at": now.isoformat(), "order": new_order}
 
+    @app.get("/editor_content/<string:location>")
+    def get_editor_content(location):
+        require_key()
+        row = EditorContent.query.get(location)
+        if not row:
+            abort(404)
+        return {
+            "location": row.location,
+            "content": row.content,
+            "updated_at": row.updated_at.isoformat()
+        }
+
+    @app.put("/editor_content/<string:location>")
+    def put_editor_content(location):
+        require_key()
+        d = request.get_json(force=True) or {}
+        content = d.get("content")
+        if content is None or not isinstance(content, str):
+            abort(400, "content (string) required")
+        now = utcnow()
+        row = EditorContent.query.get(location)
+        if row:
+            row.content = content
+            row.updated_at = now
+        else:
+            row = EditorContent(location=location, content=content, updated_at=now)
+            db.session.add(row)
+        db.session.commit()
+        return {"ok": True, "location": location, "updated_at": now.isoformat()}
+
     # ---------- Startup DDL (light migration) ----------
     with app.app_context():
         db.create_all()
@@ -249,26 +286,46 @@ def create_app():
                 dialect = eng.dialect.name
                 if dialect.startswith("postgres"):
                     cx.execute(db.text("""
+                        -- existing columns/indexes
                         ALTER TABLE index_entries ADD COLUMN IF NOT EXISTS "order" INTEGER NOT NULL DEFAULT 0;
                         CREATE INDEX IF NOT EXISTS ix_index_entries_order ON index_entries ("order");
                         ALTER TABLE list_contents ADD COLUMN IF NOT EXISTS "order" INTEGER NOT NULL DEFAULT 0;
                         CREATE INDEX IF NOT EXISTS ix_list_contents_order ON list_contents ("order");
+
+                        -- NEW: editor_contents table
+                        CREATE TABLE IF NOT EXISTS editor_contents (
+                            location   VARCHAR(160) PRIMARY KEY,
+                            content    TEXT NOT NULL DEFAULT '',
+                            updated_at TIMESTAMP NOT NULL
+                        );
+                        CREATE INDEX IF NOT EXISTS ix_editor_contents_updated_at
+                            ON editor_contents (updated_at);
                     """))
                 else:
-                    # SQLite fallback: try-add columns and indexes (ignore if exist)
-                    def _safe(sql):
+                    # SQLite fallback: try-add columns and tables; ignore errors if they already exist
+                    def _safe(sql: str):
                         try:
                             cx.execute(db.text(sql))
                         except Exception:
                             pass
+
                     _safe('ALTER TABLE index_entries ADD COLUMN "order" INTEGER NOT NULL DEFAULT 0;')
                     _safe('CREATE INDEX IF NOT EXISTS ix_index_entries_order ON index_entries ("order");')
                     _safe('ALTER TABLE list_contents ADD COLUMN "order" INTEGER NOT NULL DEFAULT 0;')
                     _safe('CREATE INDEX IF NOT EXISTS ix_list_contents_order ON list_contents ("order");')
+
+                    # NEW: editor_contents table + index
+                    _safe("""
+                        CREATE TABLE IF NOT EXISTS editor_contents (
+                            location   TEXT PRIMARY KEY,
+                            content    TEXT NOT NULL DEFAULT '',
+                            updated_at TEXT NOT NULL
+                        );
+                    """)
+                    _safe("CREATE INDEX IF NOT EXISTS ix_editor_contents_updated_at ON editor_contents (updated_at);")
         except Exception as e:
             # Log but don’t block app start
             print("[migration warn]", e)
-
     return app
 
 app = create_app()
